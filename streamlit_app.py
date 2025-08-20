@@ -301,59 +301,58 @@ def generate_rota_strict():
     return warnings
 
 # =========================
-# BUTTON + EXCEL EXPORT
+# BUTTON + EXCEL EXPORT  (ADMIN ONLY)
 # =========================
-st.markdown("---")
-gen_col, info_col = st.columns([1, 2])
-with gen_col:
-    click_generate = st.button("🧮 Generate rota (strict) & download Excel", use_container_width=True)
-with info_col:
-    st.caption("Enforces **1 shift/day** and **≥11h rest**. Uses saved **per-person per-shift targets**. Leaves slots unfilled (with warnings) if rules block coverage.")
+if is_admin:
+    st.markdown("---")
+    gen_col, info_col = st.columns([1, 2])
+    with gen_col:
+        click_generate = st.button("🧮 Generate rota (strict) & download Excel", use_container_width=True)
+    with info_col:
+        st.caption("Enforces **1 shift/day** and **≥11h rest**. Uses saved **per-person per-shift targets**. Leaves slots unfilled (with warnings) if rules block coverage.")
 
-if click_generate and is_admin:
-    warnings = generate_rota_strict()
+    if click_generate:
+        warnings = generate_rota_strict()
 
-    rota_df = pd.read_sql(
-        "SELECT day, shift, name, email FROM assignments WHERE day BETWEEN ? AND ? ORDER BY day, shift",
-        conn, params=(period_start.isoformat(), period_end.isoformat())
-    )
+        rota_df = pd.read_sql(
+            "SELECT day, shift, name, email FROM assignments WHERE day BETWEEN ? AND ? ORDER BY day, shift",
+            conn, params=(period_start.isoformat(), period_end.isoformat())
+        )
 
-    # Excel
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        # Pivoted rota
-        grid = rota_df.pivot_table(index="day", columns="shift", values="name",
-                                   aggfunc=lambda x: ", ".join(sorted(set(x)))).reset_index()
-        grid.to_excel(writer, sheet_name="Rota", index=False)
-        rota_df.to_excel(writer, sheet_name="Assignments (raw)", index=False)
+        # Build Excel
+        import io
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            grid = rota_df.pivot_table(index="day", columns="shift", values="name",
+                                       aggfunc=lambda x: ", ".join(sorted(set(x)))).reset_index()
+            grid.to_excel(writer, sheet_name="Rota", index=False)
+            rota_df.to_excel(writer, sheet_name="Assignments (raw)", index=False)
 
-        # Include targets sheet for reference
-        q_now = pd.read_sql("SELECT email, shift, target FROM quotas", conn)
-        q_piv = q_now.pivot(index="email", columns="shift", values="target").reindex(ALL_USERS).reindex(columns=SHIFTS)
-        q_piv.to_excel(writer, sheet_name="Targets", index=True)
+            q_now = pd.read_sql("SELECT email, shift, target FROM quotas", conn)
+            q_piv = q_now.pivot(index="email", columns="shift", values="target").reindex(ALL_USERS).reindex(columns=SHIFTS)
+            q_piv.to_excel(writer, sheet_name="Targets", index=True)
 
-        # Include unmet targets summary
-        if not rota_df.empty:
-            counts = rota_df.groupby(["email", "shift"]).size().reset_index(name="assigned")
-            merged = q_now.merge(counts, on=["email", "shift"], how="left").fillna({"assigned": 0})
-            merged["unmet_target"] = (merged["target"] - merged["assigned"]).clip(lower=0)
-            merged.sort_values(["email", "shift"], inplace=True)
-            merged.to_excel(writer, sheet_name="Targets vs Assigned", index=False)
+            if not rota_df.empty:
+                counts = rota_df.groupby(["email", "shift"]).size().reset_index(name="assigned")
+                merged = q_now.merge(counts, on=["email", "shift"], how="left").fillna({"assigned": 0})
+                merged["unmet_target"] = (merged["target"] - merged["assigned"]).clip(lower=0)
+                merged.sort_values(["email", "shift"], inplace=True)
+                merged.to_excel(writer, sheet_name="Targets vs Assigned", index=False)
 
-    excel_bytes = output.getvalue()
-    fname = f"rota_{period_start.isoformat()}_{period_end.isoformat()}_STRICT.xlsx"
-    st.download_button(
-        label="⬇️ Download Excel rota",
-        data=excel_bytes,
-        file_name=fname,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True
-    )
+        excel_bytes = output.getvalue()
+        fname = f"rota_{period_start.isoformat()}_{period_end.isoformat()}_STRICT.xlsx"
+        st.download_button(
+            label="⬇️ Download Excel rota",
+            data=excel_bytes,
+            file_name=fname,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
 
-    if warnings:
-        with st.expander("Warnings (strict rules prevented full coverage) — open to review"):
-            for w in warnings:
-                st.write("⚠️", w)
+        if warnings:
+            with st.expander("Warnings (strict rules prevented full coverage) — open to review"):
+                for w in warnings:
+                    st.write("⚠️", w)
 
 # =========================
 # PREVIEW + DEBUG
@@ -378,3 +377,4 @@ if is_admin:
         conn, params=(period_start.isoformat(), period_end.isoformat())
     )
     st.dataframe(raw, use_container_width=True)
+
