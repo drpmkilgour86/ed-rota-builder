@@ -212,8 +212,17 @@ if is_admin:
 # GENERATION (STRICT rules)
 # =========================
 def generate_rota_strict():
+    """
+    Strict generator:
+    - One shift per person per day (enforced twice: in-memory + DB check)
+    - >= 11h rest between consecutive shifts
+    - Do NOT exceed per-shift targets nor the per-person total target (sum of their shift targets)
+    - If a slot can't be filled under the rules, leave it unfilled and record a warning
+    - Prefer people with the most remaining total target, then remaining shift target, then fewest assigned so far
+    """
     # Clear existing assignments in this period
-    c.execute("DELETE FROM assignments WHERE day BETWEEN ? AND ?", (period_start.isoformat(), period_end.isoformat()))
+    c.execute("DELETE FROM assignments WHERE day BETWEEN ? AND ?",
+              (period_start.isoformat(), period_end.isoformat()))
     conn.commit()
 
     # Load availability & quotas
@@ -225,6 +234,7 @@ def generate_rota_strict():
     quotas = pd.read_sql("SELECT email, shift, target FROM quotas", conn)
 
     # Availability map (who IS available)
+    from collections import defaultdict
     is_available = defaultdict(set)   # (day, shift) -> set(emails)
     name_map = {}
     for _, r in avail.iterrows():
@@ -236,68 +246,87 @@ def generate_rota_strict():
 
     # Targets
     target_by_shift = {(row.email, row.shift): int(row.target) for row in quotas.itertuples()}
-    # Total target per person = sum of their per-shift targets
-    total_target = quotas.groupby("email")["target"].sum().to_dict()
+    total_target = quotas.groupby("email")["target"].sum().astype(int).to_dict()
 
-    # Track counts
-    done_per_shift = defaultdict(int)  # (email, shift) -> count
-    done_total = defaultdict(int)      # email -> total assigned
-    last_end_dt = {}                   # email -> last assignment end (datetime)
+    # Quick sanity warning: total targets vs total required slots
+    days = [d for d in daterange(period_start, period_end) if not is_weekend(d)]
+    total_slots = len(days) * len(SHIFTS)  # 1 per shift per weekday
+    sum_targets = int(sum(total_target.get(e, 0) for e in ALL_USERS))
     warnings = []
+    if sum_targets < total_slots:
+        warnings.append(
+            f"Targets sum ({sum_targets}) is less than required slots ({total_slots}). "
+            "Full coverage may be impossible under strict rules."
+        )
 
-    # Helper fns
-    def shift_window(day: date, shift_label: str):
-        start_t, end_t = SHIFT_DEFS[shift_label]
-        start_dt = datetime.combine(day, start_t)
-        end_dt = datetime.combine(day, end_t)
-        if end_t <= start_t and shift_label != "Admin":
-            end_dt += timedelta(days=1)  # crosses midnight
-        return start_dt, end_dt
+    # Tracking
+    from datetime import datetime as _dt
+    done_per_shift = defaultdict(int)       # (email, shift) -> count
+    done_total = defaultdict(int)           # email -> total assigned
+    last_end_dt = {}                        # email -> last assignment end
+    assigned_today = {}                     # day_iso -> set(emails)
 
-    def hours_between(a_end: datetime, b_start: datetime) -> float:
+    def hours_between(a_end: _dt, b_start: _dt) -> float:
         return (b_start - a_end).total_seconds() / 3600.0
 
-    # Iterate all weekdays/shifts; STRICT: 1 shift/day; ≥11h rest; DO NOT exceed targets
-    for d in daterange(period_start, period_end):
-        if is_weekend(d):
-            continue
+    # Main loop: day by day
+    for d in days:
         day_iso = d.isoformat()
-        already_today = set()
+        already_today = assigned_today.setdefault(day_iso, set())
 
         for sh in SHIFTS:
             need = 1  # one person per shift per weekday
             assigned_here = 0
             start_dt, end_dt = shift_window(d, sh)
 
-            # Candidates: authorised & available & still have remaining SHIFT and TOTAL targets
-            cands = []
+            # Build candidate list:
+            # authorised, available, has remaining shift target & total target,
+            # not already assigned today, satisfies rest rule
+            cand = []
             for em in is_available.get((day_iso, sh), []):
                 if em not in ALL_USERS:
                     continue
-                # remaining shift & total
+
+                # hard caps
                 rem_shift = target_by_shift.get((em, sh), 0) - done_per_shift[(em, sh)]
                 rem_total = total_target.get(em, 0) - done_total[em]
                 if rem_shift <= 0 or rem_total <= 0:
-                    continue  # can't give this person more of this shift or any shift
-                # one shift per day
+                    continue
+
+                # one per day
                 if em in already_today:
                     continue
+
                 # rest rule
                 if em in last_end_dt and hours_between(last_end_dt[em], start_dt) < MIN_REST_HOURS:
                     continue
-                cands.append(em)
 
-            # Rank by: more remaining shift target first, then fewer total assigned
-            def rem_shift_count(em):
-                return target_by_shift.get((em, sh), 0) - done_per_shift[(em, sh)]
-            cands_sorted = sorted(cands, key=lambda e: (-rem_shift_count(e), done_total[e]))
+                cand.append(em)
 
-            picked = cands_sorted[0] if cands_sorted else None
+            # Rank candidates:
+            #   1) more remaining total target first
+            #   2) then more remaining shift target
+            #   3) then fewer total already assigned (fairness)
+            def rem_total(em): return total_target.get(em, 0) - done_total[em]
+            def rem_shift_cnt(em): return target_by_shift.get((em, sh), 0) - done_per_shift[(em, sh)]
+            cand.sort(key=lambda e: (-rem_total(e), -rem_shift_cnt(e), done_total[e]))
+
+            picked = cand[0] if cand else None
 
             if picked is None:
-                # STRICT: leave unfilled if nobody fits all constraints and targets
-                warnings.append(f"{day_iso} {sh}: unfilled (targets/constraints blocked assignment).")
+                warnings.append(f"{day_iso} {sh}: unfilled (no candidate meets all constraints/targets).")
             else:
+                # Double-check DB to avoid any duplicate-in-day edge cases
+                # (shouldn't happen, but safety first if app was re-run mid-day loop)
+                existing_same_day = pd.read_sql(
+                    "SELECT 1 FROM assignments WHERE day=? AND email=? LIMIT 1",
+                    conn, params=(day_iso, picked)
+                )
+                if not existing_same_day.empty:
+                    warnings.append(f"{day_iso} {sh}: {picked} skipped (already assigned earlier today).")
+                    continue
+
+                # Assign
                 c.execute(
                     "INSERT INTO assignments (day, shift, name, email) VALUES (?,?,?,?)",
                     (day_iso, sh, name_map.get(picked, picked), picked)
@@ -309,7 +338,7 @@ def generate_rota_strict():
                 assigned_here += 1
 
             if assigned_here < need:
-                # logged above
+                # already warned above
                 pass
 
     conn.commit()
@@ -392,5 +421,6 @@ if is_admin:
         conn, params=(period_start.isoformat(), period_end.isoformat())
     )
     st.dataframe(raw, use_container_width=True)
+
 
 
