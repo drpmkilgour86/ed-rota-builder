@@ -157,29 +157,61 @@ st.title("ED Rota Builder")
 st.caption(f"Period: {period_start.isoformat()} → {period_end.isoformat()} (weekdays only)")
 
 # =========================
-# CONSULTANT AVAILABILITY (UNavailability)
+# CONSULTANT AVAILABILITY (UNavailability + per-day master toggle)
 # =========================
 st.header(f"Your availability – {your_name}")
+st.write(f"Rota period: {period_start} → {period_end}")
+st.caption("Tick the boxes when you CANNOT do a shift. Use the per-day master switch if you’re unavailable for any shift that day.")
+
 for d in daterange(period_start, period_end):
     if is_weekend(d):
         st.markdown(f"**{d.strftime('%A %d %b %Y')}** – Weekend (no shifts)")
         continue
 
+    day_iso = d.isoformat()
     st.markdown(f"**{d.strftime('%A %d %b %Y')}**")
-    for sh in SHIFTS:
-        row = c.execute(
-            "SELECT unavailable FROM availability WHERE email=? AND day=? AND shift=?",
-            (your_email, d.isoformat(), sh)
-        ).fetchone()
-        default = bool(row[0]) if row else False
-        val = st.checkbox(f"Unavailable for {sh}", value=default, key=f"{your_email}_{d}_{sh}")
-        c.execute(
-            "INSERT OR REPLACE INTO availability (name,email,day,shift,unavailable) VALUES (?,?,?,?,?)",
-            (your_name, your_email, d.isoformat(), sh, int(val))
-        )
+
+    # Load existing per-shift values for this day
+    rows = c.execute(
+        "SELECT shift, unavailable FROM availability WHERE email=? AND day=?",
+        (your_email, day_iso)
+    ).fetchall()
+    existing_map = {r[0]: int(r[1]) for r in rows}
+
+    # Compute default for the master toggle = true iff all shifts are currently unavailable
+    if existing_map and all(existing_map.get(sh, 0) == 1 for sh in SHIFTS):
+        master_default = True
+    else:
+        master_default = False
+
+    # Per-day master switch
+    master_key = f"{your_email}_{day_iso}_ANY"
+    master_unavail = st.checkbox("Unavailable for any shift today", value=master_default, key=master_key)
+
+    # Render per-shift checkboxes; if master is true, disable and force-true
+    cols = st.columns(2)
+    for i, sh in enumerate(SHIFTS):
+        default_unavail = bool(existing_map.get(sh, 0))
+        if master_unavail:
+            val = True
+            disabled = True
+        else:
+            val = st.checkbox(
+                f"Unavailable for {sh}",
+                value=default_unavail,
+                key=f"{your_email}_{day_iso}_{sh}",
+            )
+            disabled = False  # only used for clarity
+
+        # Persist (un)availability for this shift
+        c.execute("""
+            INSERT OR REPLACE INTO availability (name, email, day, shift, unavailable)
+            VALUES (?, ?, ?, ?, ?)
+        """, (your_name, your_email, day_iso, sh, int(val)))
+
     conn.commit()
 
-st.success("Saved your (un)availability ✅")
+st.success("Your availability has been saved ✅")
 
 # =========================
 # ADMIN TOOLS: TARGETS (per-person per-shift)
@@ -432,6 +464,7 @@ if is_admin:
         conn, params=(period_start.isoformat(), period_end.isoformat())
     )
     st.dataframe(raw, use_container_width=True)
+
 
 
 
