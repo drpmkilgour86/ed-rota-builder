@@ -367,7 +367,7 @@ if is_admin:
         st.caption("Enforces **1 shift/day** and **≥11h rest**. Uses saved **per-person per-shift targets**. Leaves slots unfilled (with warnings) if rules block coverage.")
 
     if click_generate:
-        warnings = generate_rota_strict()
+        warnings = generate_rota_strict_targets()
 
         rota_df = pd.read_sql(
             "SELECT day, shift, name, email FROM assignments WHERE day BETWEEN ? AND ? ORDER BY day, shift",
@@ -432,6 +432,7 @@ if is_admin:
         conn, params=(period_start.isoformat(), period_end.isoformat())
     )
     st.dataframe(raw, use_container_width=True)
+
 
 
 
